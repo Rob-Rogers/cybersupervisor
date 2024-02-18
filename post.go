@@ -1,5 +1,5 @@
 /*
- * CyberSupervisor Passive ARP scanner
+ * CyberSupervisor GOpost
  * Copyright (C) 2024 Rob Rogers  rob@ontariohighspeed.ca
  *
  * This program is free software: you can redistribute it and/or modify
