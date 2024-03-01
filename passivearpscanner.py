@@ -13,98 +13,86 @@ Features:
 - Optional periodic summary output.
 - Logging to a specified output file or standard output.
 - Organization lookup for MAC addresses using OUI data.
-"""
-import argparse
+"""import argparse
+import json
 import threading
 import time
 from datetime import datetime
-from scapy.all import sniff, ARP, get_if_list
-import socket
-import json
-import os
+from scapy.all import ARP, sniff
+from socket import gethostbyaddr
 
-def check_root():
-    if os.geteuid() != 0:
-        exit("This script must be run as root. Try using 'sudo'.")
-
-def safe_open_write(path):
-    if os.path.exists(path):
-        raise ValueError("File already exists")
-    return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-
-def validate_interface(interface):
-    if interface not in get_if_list():
-        raise ValueError(f"Interface {interface} does not exist.")
-
-parser = argparse.ArgumentParser(description="ARP Monitor")
+# Setup command-line argument parsing
+parser = argparse.ArgumentParser(description="ARP Monitor Tool")
+parser.add_argument("--interface", help="Specify the network interface", required=True)
 parser.add_argument("--no-dns", help="Disable DNS resolution", action="store_true")
 parser.add_argument("--summary", help="Enable periodic summary output", action="store_true")
 parser.add_argument("--unix-time", help="Use Unix time for timestamps", action="store_true")
-parser.add_argument("-o", "--output-file", help="Output file for logging", type=str, default="")
-parser.add_argument("--oui-file", help="Path to OUI file", type=str, default="/usr/share/ieee-data/oui.txt")
-parser.add_argument("interface", help="Network interface to monitor")
+parser.add_argument("-o", "--output-file", help="Output file for logging")
 args = parser.parse_args()
 
+# Initialize ARP table as a dictionary
 arp_table = {}
-arp_table_lock = threading.Lock()
-output_file = None if args.output_file == "" else safe_open_write(args.output_file)
-oui_data = {}
 
-def load_oui_data(oui_file):
-    try:
-        with open(oui_file, "r") as f:
-            for line in f:
-                if "(hex)" in line:
-                    parts = line.split("(hex)")
-                    oui = parts[0].strip().replace('-', ':').lower()
-                    company_name = parts[1].strip()
-                    oui_data[oui] = company_name
-    except FileNotFoundError:
-        print(f"OUI file {oui_file} not found. Skipping OUI data load.")
+def handle_packet(packet):
+    """Process packets, filtering for ARP."""
+    if packet.haslayer(ARP):
+        if packet[ARP].op == 2:  # ARP Reply
+            process_arp(packet)
 
-def lookup_oui(mac_address):
-    oui_prefix = ":".join(mac_address.split(":")[:3])
-    return oui_data.get(oui_prefix, "Unknown")
+def process_arp(packet):
+    """Process ARP packets and update the ARP table."""
+    ip = packet[ARP].psrc
+    mac = packet[ARP].hwsrc
+    timestamp = str(int(time.time())) if args.unix_time else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    dns_name = ""
+    if not args.no_dns:
+        try:
+            dns_name = gethostbyaddr(ip)[0]
+        except Exception:
+            dns_name = "Resolution failed"
 
-def update_arp_table(pkt):
-    if ARP in pkt and pkt[ARP].op == 2:
-        src_ip = pkt[ARP].psrc
-        src_mac = pkt[ARP].hwsrc
-        timestamp = str(int(time.time())) if args.unix_time else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        dns_name = "DNS disabled" if args.no_dns else socket.getfqdn(src_ip)
-        organization = lookup_oui(src_mac)
-
-        with arp_table_lock:
-            if src_ip in arp_table:
-                arp_table[src_ip]['last_seen'] = timestamp
-                arp_table[src_ip]['count'] += 1
-            else:
-                arp_table[src_ip] = {
-                    'ip': src_ip, 
-                    'mac': src_mac, 
-                    'first_seen': timestamp, 
-                    'last_seen': timestamp, 
-                    'count': 1, 
-                    'dns_name': dns_name, 
-                    'organization': organization
-                }
-            print_arp_entry(arp_table[src_ip], "Live ARP")
-
-def print_arp_entry(entry, entry_type):
-    log_entry = json.dumps({**entry, "type": entry_type})
-    if output_file is not None:
-        output_file.write(log_entry + "\n")
+    if ip not in arp_table:
+        arp_table[ip] = {
+            'mac': mac,
+            'first_seen': timestamp,
+            'last_seen': timestamp,
+            'count': 1,
+            'dns_name': dns_name
+        }
+        print_arp_entry(ip, "live")
     else:
-        print(log_entry)
+        arp_table[ip]['last_seen'] = timestamp
+        arp_table[ip]['count'] += 1
 
-def main():
-    check_root()
-    validate_interface(args.interface)
-    if args.output_file != "":
-        global output_file
-        output_file = safe_open_write(args.output_file)
-    load_oui_data(args.oui_file)
-    sniff(iface=args.interface, prn=update_arp_table, filter="arp", store=0)
+def print_arp_entry(ip, entry_type):
+    """Print ARP entry as JSON, adding entry type (live/summary) and explicitly include the IP address."""
+    entry = arp_table[ip].copy()  # Make a copy to avoid modifying the original entry
+    if entry_type == "live":
+        # For live view, exclude 'last_seen' and 'count'
+        entry.pop('last_seen', None)
+        entry.pop('count', None)
+    entry_with_type = dict(entry, type=entry_type, ip_address=ip)  # Add 'type' and 'ip_address' to entry
+    json_output = json.dumps(entry_with_type)
+    print(json_output)
+
+    if args.output_file:
+        with open(args.output_file, "a") as file:
+            file.write(json_output + "\n")
+
+def summary_printer():
+    """Periodically prints the summary of the ARP table."""
+    while args.summary:
+        time.sleep(30)  # Interval for printing the summary
+        print("\n--- ARP Table Summary ---")
+        for ip in arp_table:
+            print_arp_entry(ip, "summary")
+        print("--- End of Summary ---\n")
 
 if __name__ == "__main__":
-    main()
+    # Start the summary thread if enabled
+    if args.summary:
+        summary_thread = threading.Thread(target=summary_printer, daemon=True)
+        summary_thread.start()
+
+    print(f"Monitoring ARP packets on {args.interface}...")
+    sniff(prn=handle_packet, filter="arp", iface=args.interface, store=0)
